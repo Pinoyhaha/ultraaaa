@@ -19,6 +19,7 @@ from telegram.ext import (
 TOKEN = os.environ["BOT_TOKEN"]
 TZ = ZoneInfo("Asia/Manila")
 DB_PATH = os.environ.get("DB_PATH", "activity.db")
+DESTINATION_CHAT_ID = os.environ.get("DESTINATION_CHAT_ID", "").strip()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -69,6 +70,10 @@ def is_supported(message):
     return bool(message and (message.video or message.document))
 
 
+def is_video(message):
+    return bool(message and message.video)
+
+
 async def admin(update):
     chat = update.effective_chat
     user = update.effective_user
@@ -114,7 +119,7 @@ def active_names(chat_id):
     with db() as con:
         rows = con.execute(
             """
-            SELECT m.name FROM members m
+            SELECT DISTINCT m.name FROM members m
             JOIN activity a ON a.chat_id=m.chat_id AND a.user_id=m.user_id
             WHERE m.chat_id=? AND m.active=1 AND a.day=?
             ORDER BY lower(m.name)
@@ -141,11 +146,13 @@ def inactive_rows(chat_id):
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    destination_status = "enabled" if DESTINATION_CHAT_ID else "disabled (set DESTINATION_CHAT_ID)"
     await update.effective_message.reply_text(
         "Telegram Activity Bot\n\n"
         "/message - show today's video/file activity\n"
         "/kick - preview inactive members\n"
-        "/kick_confirm - confirm the pending kick list"
+        "/kick_confirm - confirm the pending kick list\n\n"
+        f"Automatic video copying: {destination_status}"
     )
 
 
@@ -155,7 +162,22 @@ async def track(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not message or not chat or not user or user.is_bot or not is_supported(message):
         return
+
     record_activity(chat.id, user.id, name_of(user))
+
+    # Copy only videos from the monitored source group to one configured destination.
+    # copy_message preserves the original caption by default and does not require
+    # downloading the video to Railway.
+    if is_video(message) and DESTINATION_CHAT_ID:
+        try:
+            await context.bot.copy_message(
+                chat_id=DESTINATION_CHAT_ID,
+                from_chat_id=chat.id,
+                message_id=message.message_id,
+            )
+            log.info("Copied video %s from chat %s to %s", message.message_id, chat.id, DESTINATION_CHAT_ID)
+        except Exception:
+            log.exception("Could not copy video %s from chat %s", message.message_id, chat.id)
 
 
 async def member_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
