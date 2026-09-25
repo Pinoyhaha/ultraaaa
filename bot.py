@@ -1,7 +1,9 @@
 import logging
 import os
 import sqlite3
+import tempfile
 from datetime import datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -34,31 +36,29 @@ def today():
 
 
 def db():
-    connection = sqlite3.connect(DB_PATH)
-    connection.row_factory = sqlite3.Row
-    return connection
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    return con
 
 
 def init_db():
     with db() as con:
-        con.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS members (
-                chat_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
-                name TEXT NOT NULL,
-                joined_date TEXT NOT NULL,
-                active INTEGER NOT NULL DEFAULT 1,
-                PRIMARY KEY (chat_id, user_id)
-            );
-            CREATE TABLE IF NOT EXISTS activity (
-                chat_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
-                day TEXT NOT NULL,
-                PRIMARY KEY (chat_id, user_id, day)
-            );
-            """
-        )
+        con.executescript("""
+        CREATE TABLE IF NOT EXISTS members (
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            joined_date TEXT NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY (chat_id, user_id)
+        );
+        CREATE TABLE IF NOT EXISTS activity (
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            day TEXT NOT NULL,
+            PRIMARY KEY (chat_id, user_id, day)
+        );
+        """)
 
 
 def name_of(user):
@@ -70,11 +70,44 @@ def is_supported(message):
     return bool(message and (message.video or message.document))
 
 
-def is_video(message):
-    return bool(message and message.video)
+def record_activity(chat_id, user_id, name):
+    with db() as con:
+        con.execute("INSERT OR IGNORE INTO activity(chat_id,user_id,day) VALUES(?,?,?)", (chat_id, user_id, today()))
+        con.execute("UPDATE members SET name=?, active=1 WHERE chat_id=? AND user_id=?", (name, chat_id, user_id))
 
 
-async def admin(update):
+def add_member(chat_id, user_id, name):
+    with db() as con:
+        con.execute("INSERT OR IGNORE INTO members(chat_id,user_id,name,joined_date,active) VALUES(?,?,?,?,1)", (chat_id, user_id, name, today()))
+        con.execute("UPDATE members SET name=?, active=1 WHERE chat_id=? AND user_id=?", (name, chat_id, user_id))
+
+
+def mark_left(chat_id, user_id):
+    with db() as con:
+        con.execute("UPDATE members SET active=0 WHERE chat_id=? AND user_id=?", (chat_id, user_id))
+
+
+def active_names(chat_id):
+    with db() as con:
+        rows = con.execute("""
+            SELECT DISTINCT m.name FROM members m
+            JOIN activity a ON a.chat_id=m.chat_id AND a.user_id=m.user_id
+            WHERE m.chat_id=? AND m.active=1 AND a.day=? ORDER BY lower(m.name)
+        """, (chat_id, today())).fetchall()
+    return [r["name"] for r in rows]
+
+
+def inactive_rows(chat_id):
+    with db() as con:
+        return con.execute("""
+            SELECT m.user_id, m.name FROM members m
+            WHERE m.chat_id=? AND m.active=1 AND NOT EXISTS (
+                SELECT 1 FROM activity a WHERE a.chat_id=m.chat_id AND a.user_id=m.user_id AND a.day=?
+            ) ORDER BY lower(m.name)
+        """, (chat_id, today())).fetchall()
+
+
+async def is_admin(update):
     chat = update.effective_chat
     user = update.effective_user
     if not chat or not user:
@@ -83,77 +116,53 @@ async def admin(update):
     return member.status in {ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER}
 
 
-def record_activity(chat_id, user_id, name):
-    with db() as con:
-        con.execute(
-            "INSERT OR IGNORE INTO activity(chat_id,user_id,day) VALUES(?,?,?)",
-            (chat_id, user_id, today()),
-        )
-        con.execute(
-            "UPDATE members SET name=?, active=1 WHERE chat_id=? AND user_id=?",
-            (name, chat_id, user_id),
-        )
-
-
-def add_member(chat_id, user_id, name):
-    with db() as con:
-        con.execute(
-            "INSERT OR IGNORE INTO members(chat_id,user_id,name,joined_date,active) VALUES(?,?,?,?,1)",
-            (chat_id, user_id, name, today()),
-        )
-        con.execute(
-            "UPDATE members SET name=?, active=1 WHERE chat_id=? AND user_id=?",
-            (name, chat_id, user_id),
-        )
-
-
-def mark_left(chat_id, user_id):
-    with db() as con:
-        con.execute(
-            "UPDATE members SET active=0 WHERE chat_id=? AND user_id=?",
-            (chat_id, user_id),
-        )
-
-
-def active_names(chat_id):
-    with db() as con:
-        rows = con.execute(
-            """
-            SELECT DISTINCT m.name FROM members m
-            JOIN activity a ON a.chat_id=m.chat_id AND a.user_id=m.user_id
-            WHERE m.chat_id=? AND m.active=1 AND a.day=?
-            ORDER BY lower(m.name)
-            """,
-            (chat_id, today()),
-        ).fetchall()
-    return [row["name"] for row in rows]
-
-
-def inactive_rows(chat_id):
-    with db() as con:
-        return con.execute(
-            """
-            SELECT m.user_id, m.name FROM members m
-            WHERE m.chat_id=? AND m.active=1
-              AND NOT EXISTS (
-                SELECT 1 FROM activity a
-                WHERE a.chat_id=m.chat_id AND a.user_id=m.user_id AND a.day=?
-              )
-            ORDER BY lower(m.name)
-            """,
-            (chat_id, today()),
-        ).fetchall()
-
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    destination_status = "enabled" if ADMIN_CHAT_ID else "disabled (set ADMIN_CHAT_ID)"
+    status = "enabled" if ADMIN_CHAT_ID else "disabled (set ADMIN_CHAT_ID)"
     await update.effective_message.reply_text(
         "Telegram Activity Bot\n\n"
-        "/message - show today's video/file activity\n"
+        "/message - today's video/file activity\n"
         "/kick - preview inactive members\n"
-        "/kick_confirm - confirm the pending kick list\n\n"
-        f"Automatic video delivery to admin: {destination_status}"
+        "/kick_confirm - confirm pending kicks\n"
+        "/scan - show video delivery status\n\n"
+        f"Temporary video saving and admin delivery: {status}\n"
+        "Videos are deleted from local storage after successful delivery."
     )
+
+
+async def deliver_video(message, context):
+    if not ADMIN_CHAT_ID:
+        log.warning("ADMIN_CHAT_ID is not configured")
+        return False
+    if not message.video:
+        return False
+
+    temp_path = None
+    try:
+        telegram_file = await context.bot.get_file(message.video.file_id)
+        with tempfile.NamedTemporaryFile(prefix="telegram_video_", suffix=".mp4", delete=False) as temp:
+            temp_path = temp.name
+        await telegram_file.download_to_drive(custom_path=temp_path)
+
+        with open(temp_path, "rb") as video_file:
+            await context.bot.send_video(
+                chat_id=ADMIN_CHAT_ID,
+                video=video_file,
+                caption=message.caption,
+                caption_entities=message.caption_entities,
+                supports_streaming=True,
+            )
+        log.info("Delivered video %s to admin %s", message.message_id, ADMIN_CHAT_ID)
+        return True
+    except Exception:
+        log.exception("Video delivery failed for message %s", message.message_id)
+        return False
+    finally:
+        if temp_path:
+            try:
+                Path(temp_path).unlink(missing_ok=True)
+                log.info("Deleted temporary video file %s", temp_path)
+            except Exception:
+                log.exception("Could not delete temporary file %s", temp_path)
 
 
 async def track(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -162,49 +171,41 @@ async def track(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not message or not chat or not user or user.is_bot or not is_supported(message):
         return
-
     record_activity(chat.id, user.id, name_of(user))
+    if message.video:
+        await deliver_video(message, context)
 
-    # Copy only videos from the monitored source group to the configured admin chat.
-    # copy_message preserves the original caption by default and does not require
-    # downloading the video to Railway.
-    if is_video(message) and ADMIN_CHAT_ID:
-        try:
-            await context.bot.copy_message(
-                chat_id=ADMIN_CHAT_ID,
-                from_chat_id=chat.id,
-                message_id=message.message_id,
-            )
-            log.info("Copied video %s from chat %s to admin %s", message.message_id, chat.id, ADMIN_CHAT_ID)
-        except Exception:
-            log.exception("Could not copy video %s from chat %s to admin %s", message.message_id, chat.id, ADMIN_CHAT_ID)
+
+async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update):
+        await update.effective_message.reply_text("Admins only.")
+        return
+    if not ADMIN_CHAT_ID:
+        await update.effective_message.reply_text("Video delivery is disabled. Set ADMIN_CHAT_ID in Railway.")
+        return
+    await update.effective_message.reply_text(
+        "Automatic video delivery is enabled. New videos are downloaded temporarily, sent to the admin, and deleted afterward.\n\n"
+        "Telegram's regular Bot API does not allow this command to scan the entire old group history."
+    )
 
 
 async def member_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
     change = update.chat_member
     if not change:
         return
-    old = change.old_chat_member.status
-    new = change.new_chat_member.status
-    chat_id = change.chat.id
-    user = change.new_chat_member.user
-    joined = new in {ChatMemberStatus.MEMBER, ChatMemberStatus.RESTRICTED} and old in {
-        ChatMemberStatus.LEFT,
-        ChatMemberStatus.KICKED,
-    }
-    left = new in {ChatMemberStatus.LEFT, ChatMemberStatus.KICKED}
-    if joined and not user.is_bot:
+    old, new = change.old_chat_member.status, change.new_chat_member.status
+    user, chat_id = change.new_chat_member.user, change.chat.id
+    if new in {ChatMemberStatus.MEMBER, ChatMemberStatus.RESTRICTED} and old in {ChatMemberStatus.LEFT, ChatMemberStatus.KICKED} and not user.is_bot:
         add_member(chat_id, user.id, name_of(user))
-    elif left:
+    elif new in {ChatMemberStatus.LEFT, ChatMemberStatus.KICKED}:
         mark_left(chat_id, user.id)
 
 
 async def message_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await admin(update):
+    if not await is_admin(update):
         await update.effective_message.reply_text("Admins only.")
         return
-    chat_id = update.effective_chat.id
-    names = active_names(chat_id)
+    names = active_names(update.effective_chat.id)
     lines = [f"DAILY ACTIVITY - {today()}", "", f"Active members: {len(names)}"]
     lines.extend(f"{i}. {n}" for i, n in enumerate(names, 1))
     if not names:
@@ -213,22 +214,17 @@ async def message_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def kick_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await admin(update):
+    if not await is_admin(update):
         await update.effective_message.reply_text("Admins only.")
         return
     rows = inactive_rows(update.effective_chat.id)
     if not rows:
         await update.effective_message.reply_text("No eligible inactive members today.")
         return
-    context.chat_data["pending_kicks"] = [row["user_id"] for row in rows]
-    names = "\n".join(f"{i}. {row['name']}" for i, row in enumerate(rows, 1))
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Confirm kick", callback_data="kick_yes"), InlineKeyboardButton("Cancel", callback_data="kick_no")]
-    ])
-    await update.effective_message.reply_text(
-        f"Inactive members for {today()}:\n\n{names}\n\nConfirm removal?",
-        reply_markup=keyboard,
-    )
+    context.chat_data["pending_kicks"] = [r["user_id"] for r in rows]
+    names = "\n".join(f"{i}. {r['name']}" for i, r in enumerate(rows, 1))
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Confirm kick", callback_data="kick_yes"), InlineKeyboardButton("Cancel", callback_data="kick_no")]])
+    await update.effective_message.reply_text(f"Inactive members for {today()}:\n\n{names}\n\nConfirm removal?", reply_markup=keyboard)
 
 
 async def kick_confirm_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -238,7 +234,7 @@ async def kick_confirm_command(update: Update, context: ContextTypes.DEFAULT_TYP
 async def kick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if not await admin(update):
+    if not await is_admin(update):
         await query.edit_message_text("Admins only.")
         return
     if query.data == "kick_no":
@@ -248,8 +244,7 @@ async def kick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user_ids:
         await query.edit_message_text("No pending kick list. Run /kick again.")
         return
-    removed = 0
-    failed = 0
+    removed = failed = 0
     for user_id in user_ids:
         try:
             await context.bot.ban_chat_member(update.effective_chat.id, user_id)
@@ -266,6 +261,7 @@ def main():
     init_db()
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("scan", scan_command))
     app.add_handler(CommandHandler("message", message_command))
     app.add_handler(CommandHandler("kick", kick_command))
     app.add_handler(CommandHandler("kick_confirm", kick_confirm_command))
